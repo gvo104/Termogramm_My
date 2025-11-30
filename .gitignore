@@ -3,3 +3,5 @@ video_term_mp4/
 
 # Игнорировать папку обработанных файлов .ptw
 num_py_convert/
+
+__pycache__/
