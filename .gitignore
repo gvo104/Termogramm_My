@@ -2,6 +2,17 @@
 video_term_mp4/
 
 # Игнорировать папку обработанных файлов .ptw
-num_py_convert/
+num_py_convert__DELLL/
 
 __pycache__/
+
+num_py_convert_new/
+
+ptw/
+
+processing_progress/
+
+Termogramm_analizator copy.ipynb
+Termogramm_analizator.ipynb
+
+CSV/
