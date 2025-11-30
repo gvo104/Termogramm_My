@@ -2,12 +2,13 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 class SpatterTracker:
     def __init__(self, max_mahalanobis_distance=10, max_frames_skipped=3, 
                  process_noise=1.0, measurement_noise=1.0, 
-                 frame_margin=10, max_velocity=100):
+                 frame_margin=10, max_velocity=100,
+                 min_movement_distance=5, min_movement_frames=3):
         """
         Инициализация трекера брызг
         
@@ -18,6 +19,8 @@ class SpatterTracker:
             measurement_noise: шум измерений для фильтра Калмана
             frame_margin: запас за границами кадра для удаления треков
             max_velocity: максимальная физически возможная скорость (пикселей/кадр)
+            min_movement_distance: минимальное расстояние перемещения за период (пикселей)
+            min_movement_frames: минимальное количество кадров для анализа движения
         """
         self.max_mahalanobis_distance = max_mahalanobis_distance
         self.max_frames_skipped = max_frames_skipped
@@ -25,8 +28,10 @@ class SpatterTracker:
         self.measurement_noise = measurement_noise
         self.frame_margin = frame_margin
         self.max_velocity = max_velocity
+        self.min_movement_distance = min_movement_distance
+        self.min_movement_frames = min_movement_frames
         
-        self.tracks = {}  # {id: {'filter': KalmanFilter, 'frames_skipped': int}}
+        self.tracks = {}  # {id: {'filter': KalmanFilter, 'frames_skipped': int, 'positions': list, 'is_static': bool}}
         self.next_id = 0
         self.frame_size = None
         
@@ -96,13 +101,49 @@ class SpatterTracker:
         
         return matches, unmatched_predictions, unmatched_measurements
     
+    def _is_static_spatter(self, track_id: int) -> bool:
+        """
+        Проверяет, является ли брызга статичной (колеблется около одной точки)
+        
+        Returns:
+            True если брызга движется меньше min_movement_distance за min_movement_frames
+        """
+        if track_id not in self.tracks:
+            return False
+            
+        track = self.tracks[track_id]
+        if 'positions' not in track or len(track['positions']) < self.min_movement_frames:
+            return False
+        
+        positions = track['positions']
+        
+        # Берем последние N позиций
+        recent_positions = positions[-self.min_movement_frames:]
+        
+        # Вычисляем общее пройденное расстояние
+        total_distance = 0
+        for i in range(1, len(recent_positions)):
+            prev_pos = recent_positions[i-1]
+            curr_pos = recent_positions[i]
+            distance = np.linalg.norm(np.array(curr_pos) - np.array(prev_pos))
+            total_distance += distance
+        
+        # Если общее расстояние меньше порога - считаем статичной
+        is_static = total_distance < self.min_movement_distance
+        
+        # Помечаем трек как статичный
+        if is_static:
+            self.tracks[track_id]['is_static'] = True
+        
+        return is_static
+    
     def update(self, spatters: List[np.ndarray], frame_width: int, frame_height: int) -> Tuple[List, int, int]:
         """
         Обновляет треки на основе новых детекций
         
         Returns:
             Tuple: (spatters_with_ids, new_tracks_count, lost_tracks_count)
-            spatters_with_ids: список [x, y, w, h, id] для каждого обнаруженного брызга
+            spatters_with_ids: список [x, y, w, h, id] только для НЕстатичных брызг
         """
         if self.frame_size is None:
             self.frame_size = (frame_width, frame_height)
@@ -129,6 +170,12 @@ class SpatterTracker:
                 del self.tracks[track_id]
                 continue
             
+            # Проверяем на статичность (только если накопилось достаточно кадров)
+            if len(track.get('positions', [])) >= self.min_movement_frames:
+                if self._is_static_spatter(track_id):
+                    # Помечаем как статичный, но не удаляем сразу (для статистики)
+                    continue
+            
             predictions.append((track_id, pred_state))
         
         # Получаем измерения
@@ -138,7 +185,7 @@ class SpatterTracker:
         matches, unmatched_predictions, unmatched_measurements = self._association(
             predictions, measurements)
         
-        # Создаем список брызг с ID
+        # Создаем список брызг с ID - ТОЛЬКО НЕСТАТИЧНЫЕ
         spatters_with_ids = []
         
         # Обновление сопоставленных треков
@@ -148,9 +195,19 @@ class SpatterTracker:
             self.tracks[track_id]['filter'].update(measurement)
             self.tracks[track_id]['frames_skipped'] = 0
             
-            # Добавляем брызг с ID
+            # Сохраняем историю позиций
+            if 'positions' not in self.tracks[track_id]:
+                self.tracks[track_id]['positions'] = []
             x, y, w, h = measurement
-            spatters_with_ids.append([x, y, w, h, track_id])
+            self.tracks[track_id]['positions'].append((x, y))
+            
+            # Ограничиваем длину истории
+            if len(self.tracks[track_id]['positions']) > self.min_movement_frames * 2:
+                self.tracks[track_id]['positions'] = self.tracks[track_id]['positions'][-self.min_movement_frames * 2:]
+            
+            # Добавляем брызг с ID ТОЛЬКО если он не статичный
+            if not self.tracks[track_id].get('is_static', False):
+                spatters_with_ids.append([x, y, w, h, track_id])
         
         # Обновление несопоставленных треков (пропуск кадра)
         lost_tracks_count = 0
@@ -169,7 +226,9 @@ class SpatterTracker:
             kf = self._create_kalman_filter(x, y, w, h)
             self.tracks[self.next_id] = {
                 'filter': kf,
-                'frames_skipped': 0
+                'frames_skipped': 0,
+                'positions': [(x, y)],  # Начинаем собирать историю позиций
+                'is_static': False  # Новые треки по умолчанию не статичные
             }
             
             # Добавляем новый брызг с ID
@@ -187,7 +246,9 @@ def track_spatters_with_ids(cleaned_spatters: List[np.ndarray],
                           process_noise: float = 1.0,
                           measurement_noise: float = 1.0,
                           frame_margin: int = 10,
-                          max_velocity: float = 100) -> Tuple[List, pd.DataFrame]:
+                          max_velocity: float = 100,
+                          min_movement_distance: float = 5,
+                          min_movement_frames: int = 3) -> Tuple[List, pd.DataFrame]:
     """
     Трекинг брызг с назначением ID и расчет статистики
     
@@ -201,10 +262,12 @@ def track_spatters_with_ids(cleaned_spatters: List[np.ndarray],
         measurement_noise: Шум измерений для фильтра Калмана
         frame_margin: Запас за границами кадра для удаления треков
         max_velocity: Макс. физически возможная скорость (пикселей/кадр)
+        min_movement_distance: Мин. расстояние перемещения для фильтрации статичных брызг
+        min_movement_frames: Мин. количество кадров для анализа движения
     
     Returns:
         Tuple: (cleaned_spatters_id, stats_dataframe)
-        - cleaned_spatters_id: список массивов [x, y, w, h, id] для каждого кадра
+        - cleaned_spatters_id: список массивов [x, y, w, h, id] только для НЕстатичных брызг
         - stats_dataframe: DataFrame со статистикой по кадрам
     """
     
@@ -214,7 +277,9 @@ def track_spatters_with_ids(cleaned_spatters: List[np.ndarray],
         process_noise=process_noise,
         measurement_noise=measurement_noise,
         frame_margin=frame_margin,
-        max_velocity=max_velocity
+        max_velocity=max_velocity,
+        min_movement_distance=min_movement_distance,
+        min_movement_frames=min_movement_frames
     )
     
     cleaned_spatters_id = []
@@ -227,11 +292,17 @@ def track_spatters_with_ids(cleaned_spatters: List[np.ndarray],
         
         cleaned_spatters_id.append(np.array(spatters_with_ids) if spatters_with_ids else np.array([]))
         
-        # Рассчитываем статистику для активных треков
+        # Рассчитываем статистику для активных треков - ТОЛЬКО НЕСТАТИЧНЫХ
         velocities = []
         areas = []
+        static_count = 0
         
         for track_id, track_data in tracker.tracks.items():
+            # Пропускаем статичные треки в статистике скорости и площади
+            if track_data.get('is_static', False):
+                static_count += 1
+                continue
+                
             # Скорость из состояния фильтра Калмана
             velocity = np.linalg.norm(track_data['filter'].x[2:4])
             velocities.append(velocity)
@@ -244,11 +315,11 @@ def track_spatters_with_ids(cleaned_spatters: List[np.ndarray],
         # Собираем статистику по кадру
         frame_stats = {
             'frame_number': frame_idx + 1,
-            'total_spatters': len(tracker.tracks),
-            'new_spatters': new_spatters,
-            'lost_spatters': lost_spatters,
-            'mean_velocity': np.mean(velocities) if velocities else 0,
-            'mean_area': np.mean(areas) if areas else 0
+            'spatters_total': len(tracker.tracks) - static_count,  # только нестатические
+            'spatters_new': new_spatters,
+            'spatters_lost': lost_spatters,
+            'spatters_mean_velocity': np.mean(velocities) if velocities else 0,
+            'spatters_mean_area': np.mean(areas) if areas else 0
         }
         
         results.append(frame_stats)
