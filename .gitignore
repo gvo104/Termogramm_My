@@ -20,3 +20,5 @@ CSV/
 thermograms_all_in_one/
 thermograms_data/
 thermograms_all_in_one_normalized/
+thermograms_all_in_one_normalized_smooth/
+thermograms_TEST_ZONE_CUT_normalized_smooth/
