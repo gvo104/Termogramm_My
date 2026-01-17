@@ -24,3 +24,5 @@ thermograms_all_in_one_normalized_smooth/
 thermograms_TEST_ZONE_CUT_normalized_smooth/
 cnn_data/
 cnn_data_MULTICLASS/
+Fin_exp_models/
+Progress_Streaming_Processing/
