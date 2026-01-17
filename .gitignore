@@ -30,3 +30,5 @@ Data/NumPy_convert/
 Data/Filtered/
 *.npy
 *.ptw
+*.csv
+*.pkl
